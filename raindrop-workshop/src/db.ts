@@ -342,6 +342,9 @@ export function deleteRun(runId: string) {
     tx.delete(schema.steering_events)
       .where(or(eq(schema.steering_events.observed_run_id, runId), eq(schema.steering_events.observer_run_id, runId)))
       .run();
+    tx.delete(schema.harness_firings)
+      .where(or(eq(schema.harness_firings.observed_run_id, runId), eq(schema.harness_firings.observer_run_id, runId)))
+      .run();
     tx.delete(schema.spans).where(eq(schema.spans.run_id, runId)).run();
     tx.delete(schema.live_events).where(eq(schema.live_events.trace_id, runId)).run();
     tx.delete(schema.runs).where(eq(schema.runs.id, runId)).run();
@@ -648,6 +651,7 @@ export function getRunsByConvoId(convoId: string) {
 export function clearAll() {
   getDrizzleDb().transaction((tx) => {
     tx.delete(schema.steering_events).run();
+    tx.delete(schema.harness_firings).run();
     tx.delete(schema.live_events).run();
     tx.delete(schema.spans).run();
     tx.delete(schema.runs).run();

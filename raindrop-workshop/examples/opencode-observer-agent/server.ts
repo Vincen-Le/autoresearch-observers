@@ -9,6 +9,7 @@ import express from "express";
 import type { Express } from "express";
 import { loadWorkspaceEnv } from "../loadEnv.ts";
 import { DEFAULT_THRESHOLDS, runDetectors, type FiringFacts, type Pattern } from "./detection.ts";
+import { fetchSteeringForRun, recordFiring, resolveFiring } from "./firings.ts";
 import { buildPrompt } from "./prompts.ts";
 import type { WorkshopRun, WorkshopRunDetail } from "./types.ts";
 
@@ -181,10 +182,18 @@ function startAutoWatch(serviceStartedAt: number) {
     return `${scope}::${pattern}`;
   }
 
-  function startPass(run: WorkshopRun, facts: FiringFacts, fingerprint: string, record: FiringRecord) {
+  async function startPass(run: WorkshopRun, facts: FiringFacts, fingerprint: string, record: FiringRecord) {
     record.inFlight = true;
-    record.lastFiredAt = Date.now();
+    const dispatchedAt = Date.now();
+    record.lastFiredAt = dispatchedAt;
     record.fingerprint = fingerprint;
+    void recordFiring({
+      workshopBase: WORKSHOP_BASE,
+      observedRunId: run.id,
+      facts,
+      fingerprint,
+      outcome: "dispatched",
+    });
     const prompt = buildPrompt({
       observedRunId: run.id,
       workshopBase: WORKSHOP_BASE,
@@ -193,27 +202,78 @@ function startAutoWatch(serviceStartedAt: number) {
     });
     const targetTag = facts.subagentSpanId ? facts.subagentSpanId.slice(0, 8) : "main";
     console.log(`[observer] firing ${facts.pattern} on ${run.id.slice(0, 8)}/${targetTag} (${facts.subagentLabel}): ${facts.summary}`);
-    runObserverOnce(
-      run.id,
-      prompt,
-      facts.pattern,
-      DEFAULT_MODEL,
-      (chunk) => {
-        const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
-        for (const line of text.split("\n")) {
-          if (line.trim()) console.log(`[observer:${run.id.slice(0, 8)}/${targetTag}:${facts.pattern}] ${line}`);
-        }
-      },
-    )
-      .then((code) => {
-        console.log(`[observer] completed ${facts.pattern} pass on ${run.id.slice(0, 8)}/${targetTag} exit=${code}`);
-      })
-      .catch((err) => {
-        console.error(`[observer] failed ${facts.pattern} pass on ${run.id.slice(0, 8)}/${targetTag}:`, err);
-      })
-      .finally(() => {
-        record.inFlight = false;
+    let code = 0;
+    try {
+      code = await runObserverOnce(
+        run.id,
+        prompt,
+        facts.pattern,
+        DEFAULT_MODEL,
+        (chunk) => {
+          const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+          for (const line of text.split("\n")) {
+            if (line.trim()) console.log(`[observer:${run.id.slice(0, 8)}/${targetTag}:${facts.pattern}] ${line}`);
+          }
+        },
+      );
+      console.log(`[observer] completed ${facts.pattern} pass on ${run.id.slice(0, 8)}/${targetTag} exit=${code}`);
+    } catch (err) {
+      console.error(`[observer] failed ${facts.pattern} pass on ${run.id.slice(0, 8)}/${targetTag}:`, err);
+      code = 1;
+    } finally {
+      record.inFlight = false;
+    }
+
+    if (code !== 0) {
+      await resolveFiring({
+        workshopBase: WORKSHOP_BASE,
+        observedRunId: run.id,
+        scope: facts.scope,
+        pattern: facts.pattern,
+        fingerprint,
+        outcome: "failed_llm",
+        outcomeReason: `opencode subprocess exit=${code}`,
       });
+      return;
+    }
+
+    const expectedSource = `harness:${facts.pattern}`;
+    let steeringId: string | undefined;
+    let observerRunId: string | undefined;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await new Promise((r) => setTimeout(r, 750));
+      const events = await fetchSteeringForRun(WORKSHOP_BASE, run.id);
+      const match = events.find(
+        (e) => e.created_at >= dispatchedAt && e.source === expectedSource,
+      );
+      if (match) {
+        steeringId = match.id;
+        observerRunId = match.observer_run_id ?? undefined;
+        break;
+      }
+    }
+    if (steeringId) {
+      await resolveFiring({
+        workshopBase: WORKSHOP_BASE,
+        observedRunId: run.id,
+        scope: facts.scope,
+        pattern: facts.pattern,
+        fingerprint,
+        outcome: "actuated",
+        steeringEventId: steeringId,
+        observerRunId,
+      });
+    } else {
+      await resolveFiring({
+        workshopBase: WORKSHOP_BASE,
+        observedRunId: run.id,
+        scope: facts.scope,
+        pattern: facts.pattern,
+        fingerprint,
+        outcome: "declined_llm",
+        outcomeReason: "LLM ran but did not POST a steering event",
+      });
+    }
   }
 
   async function tick() {
@@ -239,10 +299,40 @@ function startAutoWatch(serviceStartedAt: number) {
             record = { fingerprint: "", inFlight: false, lastFiredAt: 0 };
             firings.set(key, record);
           }
-          if (record.inFlight) continue;
-          if (record.fingerprint === fingerprint) continue;
-          if (now - record.lastFiredAt < COOLDOWN_MS) continue;
-          startPass(run, facts, fingerprint, record);
+          if (record.inFlight) {
+            void recordFiring({
+              workshopBase: WORKSHOP_BASE,
+              observedRunId: run.id,
+              facts,
+              fingerprint,
+              outcome: "suppressed_inflight",
+              outcomeReason: "another LLM pass for this (scope, pattern) is in flight",
+            });
+            continue;
+          }
+          if (record.fingerprint === fingerprint) {
+            void recordFiring({
+              workshopBase: WORKSHOP_BASE,
+              observedRunId: run.id,
+              facts,
+              fingerprint,
+              outcome: "suppressed_fingerprint",
+              outcomeReason: "fingerprint matches the most recently dispatched firing",
+            });
+            continue;
+          }
+          if (now - record.lastFiredAt < COOLDOWN_MS) {
+            void recordFiring({
+              workshopBase: WORKSHOP_BASE,
+              observedRunId: run.id,
+              facts,
+              fingerprint,
+              outcome: "suppressed_cooldown",
+              outcomeReason: `cooldown active; ${Math.round((COOLDOWN_MS - (now - record.lastFiredAt)) / 1000)}s remaining`,
+            });
+            continue;
+          }
+          void startPass(run, facts, fingerprint, record);
         }
       }
     } catch (err) {

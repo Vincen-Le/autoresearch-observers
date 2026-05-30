@@ -140,6 +140,32 @@ export const annotations = sqliteTable(
   ],
 );
 
+export const harness_firings = sqliteTable(
+  "harness_firings",
+  {
+    id: text("id").primaryKey(),
+    observed_run_id: text("observed_run_id").notNull(),
+    subagent_span_id: text("subagent_span_id"),
+    subagent_label: text("subagent_label"),
+    pattern: text("pattern").notNull(),
+    scope: text("scope").notNull(),
+    fingerprint: text("fingerprint").notNull(),
+    summary: text("summary"),
+    evidence: text("evidence"),
+    outcome: text("outcome").notNull(),
+    outcome_reason: text("outcome_reason"),
+    observer_run_id: text("observer_run_id"),
+    steering_event_id: text("steering_event_id"),
+    created_at: integer("created_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+  },
+  (table) => [
+    index("idx_harness_observed").on(table.observed_run_id, desc(table.created_at)),
+    index("idx_harness_outcome").on(table.outcome),
+    index("idx_harness_observer").on(table.observer_run_id).where(sql`${table.observer_run_id} IS NOT NULL`),
+  ],
+);
+
 export const steering_events = sqliteTable(
   "steering_events",
   {
