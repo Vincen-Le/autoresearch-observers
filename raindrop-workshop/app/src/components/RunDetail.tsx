@@ -33,6 +33,7 @@ import { useAnnotations } from "../hooks/use-annotations";
 import type { Annotation, AnnotationKind } from "../hooks/use-annotations";
 import { useAgentForEvent } from "../hooks/use-agents";
 import { useSteering } from "../hooks/use-steering";
+import { HarnessFiringsList } from "./HarnessFiringsList";
 import { useWorkshopEvent } from "../hooks/use-workshop-ws";
 import { getCostBreakdown, fmtCost } from "../utils/costs";
 import type { RunSteeringData, SteeringEvent } from "../api/steering";
@@ -1601,6 +1602,7 @@ function ObserverDebugPanel({
   return (
     <div className="flex-1 min-h-0 overflow-auto sb" style={{ padding: 16 }}>
       <div className="max-w-5xl mx-auto space-y-4">
+        <HarnessFiringsList runId={run.id} />
         <div className="rounded-lg p-4" style={{ background: "rgba(255,255,255,0.035)", border: `1px solid ${C.border}` }}>
           <div className="flex items-start justify-between gap-4">
             <div>

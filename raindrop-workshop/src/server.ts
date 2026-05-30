@@ -62,6 +62,14 @@ import {
   type SteeringAction,
   type SteeringStatus,
 } from "./steering";
+import {
+  createHarnessFiring,
+  findUnresolvedDispatched,
+  InvalidFiringError,
+  listHarnessFiringsForRun,
+  updateHarnessFiring,
+  type FiringOutcome,
+} from "./harness";
 import { replayDefaultDemoTraces } from "./demo-traces";
 
 function parseAnnotationSource(value: unknown): AnnotationSource | null {
@@ -1687,6 +1695,124 @@ export async function createServer(port: number) {
       res.status(201).json({ ok: true, mocked: event.status === "mock_applied", event });
     } catch (err) {
       if (err instanceof InvalidSteeringEventError) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      throw err;
+    }
+  });
+
+  app.get("/api/runs/:id/harness-firings", (req, res) => {
+    res.json({ firings: listHarnessFiringsForRun(req.params.id) });
+  });
+
+  app.post("/api/harness/firings", (req, res) => {
+    const body = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>) : {};
+    try {
+      const observedRunId = bodyString(body, "observed_run_id", "observedRunId");
+      if (!observedRunId) {
+        res.status(400).json({ error: "observed_run_id required" });
+        return;
+      }
+      const outcome = bodyString(body, "outcome") as FiringOutcome | undefined;
+      if (!outcome) {
+        res.status(400).json({ error: "outcome required" });
+        return;
+      }
+      const pattern = bodyString(body, "pattern");
+      const scope = bodyString(body, "scope");
+      const fingerprint = bodyString(body, "fingerprint");
+      if (!pattern || !scope || !fingerprint) {
+        res.status(400).json({ error: "pattern, scope, fingerprint required" });
+        return;
+      }
+      const evidence = body.evidence ?? null;
+      const firing = createHarnessFiring({
+        observed_run_id: observedRunId,
+        subagent_span_id: bodyString(body, "subagent_span_id", "subagentSpanId") ?? null,
+        subagent_label: bodyString(body, "subagent_label", "subagentLabel") ?? null,
+        pattern,
+        scope,
+        fingerprint,
+        summary: bodyString(body, "summary"),
+        evidence,
+        outcome,
+        outcome_reason: bodyString(body, "outcome_reason", "outcomeReason"),
+        observer_run_id: bodyString(body, "observer_run_id", "observerRunId") ?? null,
+        steering_event_id: bodyString(body, "steering_event_id", "steeringEventId") ?? null,
+      });
+      broadcast("harness_firing", { op: "insert", observed_run_id: firing.observed_run_id, firing });
+      res.status(201).json({ ok: true, firing });
+    } catch (err) {
+      if (err instanceof InvalidFiringError) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      throw err;
+    }
+  });
+
+  app.patch("/api/harness/firings/:id", (req, res) => {
+    const body = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>) : {};
+    try {
+      const outcome = bodyString(body, "outcome") as FiringOutcome | undefined;
+      const updated = updateHarnessFiring(req.params.id, {
+        outcome,
+        outcome_reason: bodyString(body, "outcome_reason", "outcomeReason"),
+        observer_run_id: bodyString(body, "observer_run_id", "observerRunId") ?? null,
+        steering_event_id: bodyString(body, "steering_event_id", "steeringEventId") ?? null,
+      });
+      if (!updated) {
+        res.status(404).json({ error: "firing not found" });
+        return;
+      }
+      broadcast("harness_firing", { op: "update", observed_run_id: updated.observed_run_id, firing: updated });
+      res.json({ ok: true, firing: updated });
+    } catch (err) {
+      if (err instanceof InvalidFiringError) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      throw err;
+    }
+  });
+
+  app.post("/api/harness/firings/resolve", (req, res) => {
+    const body = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>) : {};
+    const observedRunId = bodyString(body, "observed_run_id", "observedRunId");
+    const scope = bodyString(body, "scope");
+    const pattern = bodyString(body, "pattern");
+    const fingerprint = bodyString(body, "fingerprint");
+    const outcome = bodyString(body, "outcome") as FiringOutcome | undefined;
+    if (!observedRunId || !scope || !pattern || !fingerprint || !outcome) {
+      res.status(400).json({ error: "observed_run_id, scope, pattern, fingerprint, outcome required" });
+      return;
+    }
+    const firing = findUnresolvedDispatched({
+      observed_run_id: observedRunId,
+      scope,
+      pattern,
+      fingerprint,
+    });
+    if (!firing) {
+      res.status(404).json({ error: "no unresolved dispatched firing for that key" });
+      return;
+    }
+    try {
+      const updated = updateHarnessFiring(firing.id, {
+        outcome,
+        outcome_reason: bodyString(body, "outcome_reason", "outcomeReason"),
+        observer_run_id: bodyString(body, "observer_run_id", "observerRunId") ?? firing.observer_run_id,
+        steering_event_id: bodyString(body, "steering_event_id", "steeringEventId") ?? firing.steering_event_id,
+      });
+      if (!updated) {
+        res.status(404).json({ error: "firing disappeared" });
+        return;
+      }
+      broadcast("harness_firing", { op: "update", observed_run_id: updated.observed_run_id, firing: updated });
+      res.json({ ok: true, firing: updated });
+    } catch (err) {
+      if (err instanceof InvalidFiringError) {
         res.status(400).json({ error: err.message });
         return;
       }
